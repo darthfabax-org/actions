@@ -22,6 +22,17 @@ on:
         required: false
         type: string
         default: '0.69.11'
+<<<<<<< HEAD
+=======
+  
+  workflow_dispatch:
+    inputs:
+      account_directory:
+        description: 'Directory to check for drift'
+        required: true
+        type: string
+        default: 'aws/dfbx/eu-south-2'
+>>>>>>> ea6e2bef05ab1ff9b6f3e3b85e610f98ce6db28d
 
 permissions:
   id-token: write
