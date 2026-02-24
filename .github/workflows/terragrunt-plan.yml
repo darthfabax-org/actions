@@ -1,0 +1,422 @@
+name: Terragrunt Plan Workflow
+
+on:
+  workflow_call:
+    inputs:
+      # === DEPLOYMENT CONFIGURATION ===
+      working_directory:
+        description: 'Working directory for Terragrunt commands'
+        required: false
+        type: string
+        default: 'aws'
+      aws_region:
+        description: 'AWS region for deployment'
+        required: false
+        type: string
+        default: 'eu-south-2'
+
+      # === TOOL VERSIONS ===
+      tf_version:
+        description: 'Terraform version'
+        required: false
+        type: string
+        default: '1.10.3'
+      tg_version:
+        description: 'Terragrunt version'
+        required: false
+        type: string
+        default: '0.69.11'
+
+    outputs:
+      has_changes:
+        description: 'Indicates if changes were detected'
+        value: ${{ jobs.detect-changes.outputs.has_changes }}
+      matrix:
+        description: 'Matrix of directories to apply'
+        value: ${{ jobs.detect-changes.outputs.matrix }}
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================
+  # 1. DETECT MODIFIED FILES
+  # ===========================================
+  detect-changes:
+    name: Detect Modified Terragrunt Files
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.get-terragrunt-dirs.outputs.matrix }}
+      has_changes: ${{ steps.get-terragrunt-dirs.outputs.has_changes }}
+      has_infra_changes: ${{ steps.check-file-types.outputs.has_infra_changes }}
+    
+    steps:
+    # ===========================================
+    # 1.1 CHECKOUT
+    # ===========================================  
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+    # ===========================================
+    # 1.2 GET CHANGED FILES
+    # ===========================================  
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            aws/**/*.hcl
+            aws/**/*.tf
+          files_ignore: |
+            aws/_envcommon/**
+            **/*.md
+
+      - name: Check if infrastructure files changed
+        id: check-file-types
+        run: |
+          if [ -n "${{ steps.changed-files.outputs.all_changed_files }}" ]; then
+            echo "has_infra_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_infra_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get changed terragrunt files
+        id: changed-terragrunt-files
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            aws/**/terragrunt.hcl
+          files_ignore: |
+            aws/_envcommon/**
+
+      - name: Get directories with terragrunt changes
+        id: get-terragrunt-dirs
+        run: |
+          if [ -z "${{ steps.changed-terragrunt-files.outputs.all_changed_files }}" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          matrix_json=$(echo "${{ steps.changed-terragrunt-files.outputs.all_changed_files }}" | \
+            tr ' ' '\n' | xargs -I {} dirname {} | sort -u | jq -R -n '[inputs]')
+
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "matrix=$(echo "$matrix_json" | jq -c .)" >> $GITHUB_OUTPUT
+
+  # ===========================================
+  # 2. TERRAGRUNT PLAN
+  # ===========================================
+  terragrunt-plan:
+    name: 'Terragrunt Plan: ${{ matrix.directory }}'
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        directory: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+    
+    steps:
+    # ===========================================
+    # 2.1 CHECKOUT
+    # ===========================================   
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # ===========================================
+    # 2.2 VALIDATE DIRECTORY
+    # ===========================================
+    - name: Validate working directory
+      id: validate-directory
+      run: |
+        WORK_DIR="${{ matrix.directory }}"
+        echo "working_directory=$WORK_DIR" >> $GITHUB_OUTPUT
+        
+        if [ ! -d "$WORK_DIR" ]; then
+          echo "::error::Directory not found: $WORK_DIR"
+          exit 1
+        fi
+        
+        if [ ! -f "$WORK_DIR/terragrunt.hcl" ]; then
+          echo "::error::terragrunt.hcl not found in: $WORK_DIR"
+          exit 1
+        fi
+        
+        echo "::notice::✅ Validated directory: $WORK_DIR"
+
+    # ===========================================
+    # 2.3 SETUP TERRAFORM AND TERRAGRUNT
+    # ===========================================
+    - name: Setup terragrunt
+      uses: darthfabax-org/iac/.github/actions/setup-terragrunt@main
+      with:
+        terraform-version: ${{ inputs.tf_version }}
+        terragrunt-version: ${{ inputs.tg_version }}
+
+    # ===========================================
+    # 2.4 CACHE PROVIDERS
+    # ===========================================
+    - name: Cache terragrunt and terraform providers
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.terraform.d/plugin-cache
+          ${{ matrix.directory }}/.terragrunt-cache
+        key: terragrunt-${{ runner.os }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', matrix.directory), format('{0}/terragrunt.hcl', matrix.directory)) }}
+        restore-keys: |
+          terragrunt-${{ runner.os }}-
+
+    # ===========================================
+    # 2.5 CONFIGURE AWS
+    # ===========================================
+    - name: Setup AWS credentials
+      uses: darthfabax-org/iac/.github/actions/setup-aws@main
+      with:
+        role-to-assume: ${{ secrets.AWS_ACTIONS_ROLE_ARN }}
+        aws-region: ${{ inputs.aws_region }}
+        role-session-name: github-actions-terragrunt-plan
+
+    # ===========================================
+    # 2.6 TERRAGRUNT VALIDATION
+    # ===========================================
+    - name: Terragrunt format check
+      id: terragrunt-fmt
+      continue-on-error: true
+      working-directory: ${{ steps.validate-directory.outputs.working_directory }}
+      run: |
+        echo "::group::Format Check"
+        terragrunt hclfmt --terragrunt-check
+        echo "::endgroup::"
+
+    - name: Terragrunt validate
+      id: terragrunt-validate
+      working-directory: ${{ steps.validate-directory.outputs.working_directory }}
+      run: |
+        echo "::group::Validation"
+        terragrunt validate --terragrunt-non-interactive
+        echo "✅ Configuration is valid"
+        echo "::endgroup::"
+
+    # ===========================================
+    # 2.7 TERRAGRUNT PLAN (PULL REQUEST)
+    # ===========================================
+    - name: Terragrunt plan (PR - read-only)
+      id: terragrunt-plan-readonly
+      if: github.event_name == 'pull_request'
+      working-directory: ${{ steps.validate-directory.outputs.working_directory }}
+      continue-on-error: true
+      run: |
+        echo "::group::Terragrunt Plan"
+        set +e
+        terragrunt plan --terragrunt-non-interactive -input=false -no-color 2>&1 | tee plan.log
+        PLAN_EXIT=${PIPESTATUS[0]}
+        set -e
+        
+        echo "plan_exit_code=$PLAN_EXIT" >> $GITHUB_OUTPUT
+        echo "::endgroup::"
+        
+        if [ $PLAN_EXIT -ne 0 ]; then
+          echo "::error::Plan failed with exit code $PLAN_EXIT"
+          exit $PLAN_EXIT
+        fi
+
+    # ===========================================
+    # 2.8 TERRAGRUNT PLAN/APPLY (PUSH)
+    # ===========================================
+    - name: Terragrunt plan (Push - export plan artifact)
+      id: terragrunt-plan-apply
+      if: github.event_name == 'push'
+      working-directory: ${{ steps.validate-directory.outputs.working_directory }}
+      run: |
+        echo "::group::Terragrunt Plan & Export"
+        
+        PLAN_FILE_ABS="$(pwd)/tfplan"
+        echo "PLAN_PATH=$PLAN_FILE_ABS" >> $GITHUB_ENV
+        echo "plan_path=$PLAN_FILE_ABS" >> $GITHUB_OUTPUT
+        
+        terragrunt plan --terragrunt-non-interactive -input=false -out="$PLAN_FILE_ABS"
+        
+        echo "::endgroup::"
+        
+        # Validate plan file was created
+        if [ ! -f "$PLAN_FILE_ABS" ]; then
+          echo "::error::Plan file not found: $PLAN_FILE_ABS"
+          find . -name "tfplan" -type f
+          exit 1
+        fi
+        
+        FILE_SIZE=$(stat -f%z "$PLAN_FILE_ABS" 2>/dev/null || stat -c%s "$PLAN_FILE_ABS")
+        
+        if [ "$FILE_SIZE" -eq 0 ]; then
+          echo "::error::Plan file is empty"
+          exit 1
+        fi
+        
+        echo "::notice::✅ Plan file created: $FILE_SIZE bytes"
+
+    # ===========================================
+    # 2.9 POST PLAN TO PR
+    # ===========================================
+    - name: Post plan summary to PR
+      if: github.event_name == 'pull_request' && (success() || failure())
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const directory = '${{ matrix.directory }}';
+          const planStatus = '${{ steps.terragrunt-plan-readonly.outcome }}';
+          const fmtStatus = '${{ steps.terragrunt-fmt.outcome }}';
+          
+          let body = `### 📋 Terraform Plan: \`${directory}\`\n\n`;
+          
+          // Status badges
+          if (planStatus === 'success') {
+            body += '✅ **Plan Status:** Success\n';
+          } else {
+            body += '❌ **Plan Status:** Failed\n';
+          }
+          
+          if (fmtStatus === 'success') {
+            body += '✅ **Format Check:** Passed\n';
+          } else if (fmtStatus === 'failure') {
+            body += '⚠️ **Format Check:** Failed (non-blocking)\n';
+          }
+          
+          body += '\n';
+          
+          // Plan output
+          const planLogPath = `${directory}/plan.log`;
+          if (fs.existsSync(planLogPath)) {
+            const planLog = fs.readFileSync(planLogPath, 'utf8');
+            const truncatedLog = planLog.length > 60000 
+              ? planLog.substring(0, 60000) + '\n\n... (truncated)'
+              : planLog;
+            
+            body += '<details><summary>📄 Plan Output</summary>\n\n```terraform\n';
+            body += truncatedLog;
+            body += '\n```\n</details>\n';
+          }
+          
+          body += `\n---\n*Workflow: [${context.workflow}](${context.payload.repository.html_url}/actions/runs/${context.runId})*`;
+          
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body: body
+          });
+
+    # ===========================================
+    # 2.10 INFRACOST (ONLY FOR PRs WITH INFRA CHANGES)
+    # ===========================================
+    - name: Setup infracost
+      id: setup-infracost
+      if: |
+        github.event_name == 'pull_request' && 
+        needs.detect-changes.outputs.has_infra_changes == 'true'
+      uses: infracost/actions/setup@v3
+      with:
+        api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+    - name: Generate infracost breakdown
+      id: infracost-breakdown
+      if: |
+        github.event_name == 'pull_request' && 
+        needs.detect-changes.outputs.has_infra_changes == 'true'
+      working-directory: ${{ steps.validate-directory.outputs.working_directory }}
+      run: |
+        echo "::group::Calculating cost estimation"
+        infracost breakdown \
+          --path . \
+          --format json \
+          --out-file /tmp/infracost-${{ strategy.job-index }}.json
+        echo "::endgroup::"
+
+    - name: Post infracost comment to PR
+      id: infracost-pr-comment
+      if: |
+        github.event_name == 'pull_request' && 
+        needs.detect-changes.outputs.has_infra_changes == 'true'
+      run: |
+        echo "::group::Posting cost comment to PR"
+        infracost comment github \
+          --path /tmp/infracost-${{ strategy.job-index }}.json \
+          --repo $GITHUB_REPOSITORY \
+          --github-token ${{ secrets.GITHUB_TOKEN }} \
+          --pull-request ${{ github.event.pull_request.number }} \
+          --behavior update
+        echo "::endgroup::"
+
+    # ===========================================
+    # 2.11 UPLOAD PLAN ARTIFACT
+    # ===========================================
+    - name: Generate safe artifact name
+      id: generate-artifact-name
+      if: github.event_name == 'push'
+      run: |
+        DIR="${{ matrix.directory }}"
+        # Extract: aws/dfbx/eu-north-1/resources/s3/mock
+        IFS='/' read -ra PARTS <<< "$DIR"
+        ACCOUNT="${PARTS[1]}"
+        REGION="${PARTS[2]}"
+        RESOURCE_TYPE="${PARTS[4]}"
+        RESOURCE_NAME="${PARTS[5]}"
+        
+        ARTIFACT_NAME="tfplan-${ACCOUNT}-${REGION}-${RESOURCE_TYPE}-${RESOURCE_NAME}"
+        
+        echo "📦 Artifact: $ARTIFACT_NAME"
+        echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+
+    - name: Upload plan artifact
+      id: upload-plan-artifact
+      if: github.event_name == 'push'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.generate-artifact-name.outputs.artifact_name }}
+        path: ${{ steps.terragrunt-plan-apply.outputs.plan_path }}
+        retention-days: 1
+        if-no-files-found: error
+
+  # ===========================================
+  # 3. SUMMARY
+  # ===========================================
+  plan-summary:
+    name: Plan Summary
+    needs: [detect-changes, terragrunt-plan]
+    runs-on: ubuntu-latest
+    if: always() && needs.detect-changes.outputs.has_changes == 'true'
+    
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## 📊 Terragrunt Plan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Event:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ needs.terragrunt-plan.result }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================
+  # 4. NOTIFICATION
+  # ===========================================
+  notify-slack:
+    name: Notify Plan Result
+    needs: terragrunt-plan
+    if: github.event_name == 'pull_request'    
+    uses: ./.github/workflows/slack-notify.yml
+    secrets: inherit
+    with:
+      job_status: ${{ needs.terragrunt-plan.result }}
+      message: |
+        Terragrunt Plan completed
+      workflow_name: 'Terragrunt Plan'

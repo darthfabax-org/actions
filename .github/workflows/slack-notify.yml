@@ -1,0 +1,186 @@
+name: Slack Notification
+
+on:
+  workflow_call:
+    inputs:
+      job_status:
+        description: 'Job status (success, failure, cancelled, skipped)'
+        required: true
+        type: string
+      message:
+        description: 'Custom message for the notification'
+        required: true
+        type: string
+      workflow_name:
+        description: 'Name of the workflow triggering the notification'
+        required: false
+        type: string
+        default: 'GitHub Actions'
+      mention_on_failure:
+        description: 'Slack user ID or channel mention (e.g., @channel, @here, <@U123456>)'
+        required: false
+        type: string
+        default: ''
+      include_commit_info:
+        description: 'Include commit and branch information'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: true
+
+jobs:
+  send-notification:
+    name: Send Slack Notification
+    runs-on: ubuntu-latest
+
+    steps:
+    # ===========================================
+    # DETERMINE NOTIFICATION STYLE
+    # ===========================================
+    - name: Determine notification appearance
+      id: notification-style
+      run: |
+        case "${{ inputs.job_status }}" in
+          success)
+            echo "color=#36a64f" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "status_text=Success" >> $GITHUB_OUTPUT
+            ;;
+          failure)
+            echo "color=#ff0000" >> $GITHUB_OUTPUT
+            echo "emoji=🚨" >> $GITHUB_OUTPUT
+            echo "status_text=Failed" >> $GITHUB_OUTPUT
+            ;;
+          cancelled)
+            echo "color=#808080" >> $GITHUB_OUTPUT
+            echo "emoji=⚠️" >> $GITHUB_OUTPUT
+            echo "status_text=Cancelled" >> $GITHUB_OUTPUT
+            ;;
+          skipped)
+            echo "color=#d3d3d3" >> $GITHUB_OUTPUT
+            echo "emoji=⏭️" >> $GITHUB_OUTPUT
+            echo "status_text=Skipped" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "color=#0066cc" >> $GITHUB_OUTPUT
+            echo "emoji=ℹ️" >> $GITHUB_OUTPUT
+            echo "status_text=Unknown" >> $GITHUB_OUTPUT
+            ;;
+        esac
+
+    # ===========================================
+    # BUILD SLACK PAYLOAD
+    # ===========================================
+    - name: Prepare Slack message
+      id: prepare-message
+      run: |
+        # Escape message for JSON
+        MESSAGE=$(echo '${{ inputs.message }}' | jq -Rs .)
+        echo "escaped_message=$MESSAGE" >> $GITHUB_OUTPUT
+
+    # ===========================================
+    # SEND SLACK NOTIFICATION
+    # ===========================================
+    - name: Send Slack notification
+      uses: slackapi/slack-github-action@70cd7be8e40a46e8b0eced40b0de447bdb42f68e # v1.26.0
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+      with:
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "${{ steps.notification-style.outputs.color }}",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "${{ steps.notification-style.outputs.emoji }} ${{ inputs.workflow_name }}",
+                      "emoji": true
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ${{ steps.prepare-message.outputs.escaped_message }}
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Status:*\n`${{ steps.notification-style.outputs.status_text }}`"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Repository:*\n`${{ github.repository }}`"
+                      }
+                      ${{ inputs.include_commit_info == true && format(',
+                      {{
+                        "type": "mrkdwn",
+                        "text": "*Branch:*\n`{0}`"
+                      }},
+                      {{
+                        "type": "mrkdwn",
+                        "text": "*Triggered by:*\n`{1}`"
+                      }}', github.ref_name, github.actor) || '' }}
+                    ]
+                  },
+                  {
+                    "type": "actions",
+                    "elements": [
+                      {
+                        "type": "button",
+                        "text": {
+                          "type": "plain_text",
+                          "text": "View Workflow",
+                          "emoji": true
+                        },
+                        "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                        "style": "${{ inputs.job_status == 'success' && 'primary' || 'danger' }}"
+                      }
+                      ${{ inputs.include_commit_info == true && format(',
+                      {{
+                        "type": "button",
+                        "text": {{
+                          "type": "plain_text",
+                          "text": "View Commit",
+                          "emoji": true
+                        }},
+                        "url": "https://github.com/{0}/commit/{1}"
+                      }}', github.repository, github.sha) || '' }}
+                    ]
+                  }
+                  ${{ inputs.job_status == 'failure' && inputs.mention_on_failure != '' && format(',
+                  {{
+                    "type": "context",
+                    "elements": [
+                      {{
+                        "type": "mrkdwn",
+                        "text": "cc: {0}"
+                      }}
+                    ]
+                  }}', inputs.mention_on_failure) || '' }}
+                ]
+              }
+            ]
+          }
+
+    # ===========================================
+    # HANDLE NOTIFICATION FAILURES
+    # ===========================================
+    - name: Log notification status
+      if: always()
+      run: |
+        if [ "${{ job.status }}" = "success" ]; then
+          echo "::notice::Slack notification sent successfully"
+        else
+          echo "::error::Failed to send Slack notification"
+          echo "::error::Check SLACK_WEBHOOK_URL secret configuration"
+        fi

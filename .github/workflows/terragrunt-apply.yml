@@ -1,0 +1,225 @@
+name: Terragrunt Apply Workflow
+
+on:
+  workflow_call:
+    inputs:
+      # === DEPLOYMENT CONFIGURATION ===
+      working_directory:
+        description: 'Working directory for Terragrunt commands'
+        required: false
+        type: string
+        default: 'aws'
+      aws_region:
+        description: 'AWS region for deployment'
+        required: false
+        type: string
+        default: 'eu-south-2'
+        
+      # === TOOL VERSIONS ===
+      tf_version:
+        description: 'Terraform version'
+        required: false
+        type: string
+        default: '1.10.3'
+      tg_version:
+        description: 'Terragrunt version'
+        required: false
+        type: string
+        default: '0.69.11'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: terragrunt-apply-${{ github.ref }}-${{ inputs.working_directory }}
+  cancel-in-progress: false
+
+jobs:
+  # ===========================================
+  # 1. TERRAGRUNT APPLY
+  # ===========================================
+  terragrunt-apply:
+    name: 'Terragrunt Apply: ${{ matrix.directory }}'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3  # Limit concurrent applies to avoid conflicts
+      matrix:
+        directory: ['${{ inputs.working_directory }}']
+  
+    steps:
+      # ===========================================
+      # 1.1 CHECKOUT
+      # ===========================================   
+      - name: Checkout repository
+        id: checkout-repository
+        uses: actions/checkout@v4
+
+      # ===========================================
+      # 1.2 VALIDATE DIRECTORY
+      # ===========================================
+      - name: Validate working directory
+        id: validate-directory
+        run: |
+          WORK_DIR="${{ matrix.directory }}"
+          echo "working_directory=$WORK_DIR" >> $GITHUB_OUTPUT
+          
+          if [ ! -d "$WORK_DIR" ]; then
+            echo "::error::Directory not found: $WORK_DIR"
+            exit 1
+          fi
+          
+          echo "::notice::✅ Validated directory: $WORK_DIR"
+
+      # ===========================================
+      # 1.3 SETUP TERRAFORM AND TERRAGRUNT
+      # ===========================================
+      - name: Setup terragrunt
+        uses: darthfabax-org/iac/.github/actions/setup-terragrunt@main
+        with:
+          terraform-version: ${{ inputs.tf_version }}
+          terragrunt-version: ${{ inputs.tg_version }}
+
+      # ===========================================
+      # 1.4 CACHE PROVIDERS
+      # ===========================================
+      - name: Cache terragrunt and terraform providers
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.terraform.d/plugin-cache
+            ${{ matrix.directory }}/.terragrunt-cache
+          key: terragrunt-${{ runner.os }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', matrix.directory), format('{0}/terragrunt.hcl', matrix.directory)) }}
+          restore-keys: |
+            terragrunt-${{ runner.os }}-
+
+      # ===========================================
+      # 1.5 CONFIGURE AWS
+      # ===========================================
+      - name: Setup AWS credentials
+        uses: darthfabax-org/iac/.github/actions/setup-aws@main
+        with:
+          role-to-assume: ${{ secrets.AWS_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: github-actions-terragrunt-apply
+
+      # ===========================================
+      # 1.6 DOWNLOAD AND VALIDATE PLAN ARTIFACT
+      # ===========================================      
+      - name: Generate safe artifact name
+        id: generate-artifact-name
+        if: github.event_name == 'push'
+        run: |
+          DIR="${{ matrix.directory }}"
+          # Extract: aws/dfbx/region/resources/s3/resource_name
+          IFS='/' read -ra PARTS <<< "$DIR"
+          ACCOUNT="${PARTS[1]}"
+          REGION="${PARTS[2]}"
+          RESOURCE_TYPE="${PARTS[4]}"
+          RESOURCE_NAME="${PARTS[5]}"
+          
+          ARTIFACT_NAME="tfplan-${ACCOUNT}-${REGION}-${RESOURCE_TYPE}-${RESOURCE_NAME}"
+          
+          echo "📦 Artifact: $ARTIFACT_NAME"
+          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download plan artifact
+        id: download-artifact
+        uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427 # v4.1.4
+        with:
+          name: ${{ steps.generate-artifact-name.outputs.artifact_name }}
+          path: ${{ matrix.directory }}
+
+      - name: Validate plan artifact
+        id: validate-plan
+        run: |
+          PLAN_FILE="${{ matrix.directory }}/tfplan"
+          
+          echo "::group::Validating Plan Artifact"
+          
+          if [ ! -f "$PLAN_FILE" ]; then
+            echo "::error::Plan file not found: $PLAN_FILE"
+            echo "Contents of directory:"
+            ls -la "${{ matrix.directory }}"
+            exit 1
+          fi
+          
+          FILE_SIZE=$(stat -f%z "$PLAN_FILE" 2>/dev/null || stat -c%s "$PLAN_FILE")
+          
+          if [ "$FILE_SIZE" -eq 0 ]; then
+            echo "::error::Plan file is empty"
+            exit 1
+          fi
+          
+          echo "✅ Plan file validated: $FILE_SIZE bytes"
+          echo "::endgroup::"
+
+      # ===========================================
+      # 1.7 APPLY TERRAGRUNT PLAN
+      # ===========================================      
+      - name: Apply terragrunt plan
+        id: terragrunt-apply
+        working-directory: ${{ matrix.directory }}
+        run: |
+          echo "::group::Applying Terraform Plan"
+          
+          ls -la
+          
+          set +e
+          terragrunt apply \
+            --terragrunt-non-interactive \
+            -input=false \
+            -auto-approve \
+            tfplan 2>&1 | tee apply.log
+          APPLY_EXIT=${PIPESTATUS[0]}
+          set -e
+          
+          echo "::endgroup::"
+          
+          if [ $APPLY_EXIT -ne 0 ]; then
+            echo "::error::Apply failed with exit code $APPLY_EXIT"
+            cat apply.log
+            exit $APPLY_EXIT
+          fi
+          
+          echo "::notice::✅ Apply completed successfully"
+
+      # ===========================================
+      # 1.8 POST-APPLY SUMMARY
+      # ===========================================
+      - name: Generate apply summary
+        if: always()
+        run: |
+          echo "## 🚀 Terragrunt Apply Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Directory:** \`${{ matrix.directory }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ steps.terragrunt-apply.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f "${{ matrix.directory }}/apply.log" ]; then
+            echo "<details><summary>Apply Log</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            tail -n 100 "${{ matrix.directory }}/apply.log" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ===========================================
+  # 2. NOTIFICATION
+  # ===========================================
+  notify-slack:
+    name: Notify Apply Result
+    needs: terragrunt-apply
+    if: always()
+    uses: ./.github/workflows/slack-notify.yml
+    secrets: inherit
+    with:
+      job_status: ${{ needs.terragrunt-apply.result }}
+      message: |
+        Terragrunt Apply completed
+      workflow_name: 'Terragrunt Apply'

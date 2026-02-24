@@ -1,0 +1,199 @@
+name: Terragrunt Destroy Workflow
+
+on:
+  workflow_call:
+    inputs:
+      # === TERRAGRUNT DESTROY CONFIGURATION ===
+      destroy_directory:
+        description: 'Directory to destroy'
+        required: true
+        type: string
+        default: 'aws/<environment>/<region>/resources/<resource>'
+      deploy_approval_environment:
+        type: string
+        description: 'Environment for the approval stage (e.g., develop, staging, production)'
+        required: false
+        default: 'aws-deploy'
+      aws_region:
+        description: 'AWS region for credentials'
+        required: false
+        type: string
+        default: 'eu-south-2'
+
+      # === TOOL VERSIONS ===
+      tf_version:
+        description: 'Terraform version'
+        required: false
+        type: string
+        default: '1.10.3'
+      tg_version:
+        description: 'Terragrunt version'
+        required: false
+        type: string
+        default: '0.69.11'
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  
+jobs:
+    # ===========================================
+    # 1. TERRAGRUNT PLAN
+    # ===========================================
+    terragrunt-plan:
+      name: 'Terragrunt Plan: ${{ inputs.destroy_directory }}'
+      runs-on: ubuntu-latest
+      steps:
+
+      # ===========================================
+      # 1.1 CHECKOUT
+      # ===========================================
+      - name: Checkout repository
+        id: checkout-repository
+        uses: actions/checkout@v4
+
+      # ===========================================
+      # 1.2 SETUP TERRAFORM AND TERRAGRUNT
+      # ===========================================      
+      - name: Setup Terragrunt
+        uses: darthfabax-org/iac/.github/actions/setup-terragrunt@main
+        with:
+          terraform-version: ${{ inputs.tf_version }}
+          terragrunt-version: ${{ inputs.tg_version }}
+
+      # ===========================================
+      # 1.3 CONFIGURE AWS CREDENTIALS
+      # ===========================================      
+      - name: Setup AWS credentials
+        uses: darthfabax-org/iac/.github/actions/setup-aws@main
+        with:
+          role-to-assume: ${{ secrets.AWS_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: github-actions-terragrunt-destroy
+
+      # ===========================================
+      # 1.4 TERRAGRUNT PLAN
+      # ===========================================
+      - name: Terragrunt Plan
+        id: terragrunt-plan
+        working-directory: ./${{ github.event.inputs.destroy_directory }}
+        run: |
+            echo "🔥 Starting plan of: ${{ github.event.inputs.destroy_directory }}"
+            terragrunt plan -destroy --terragrunt-non-interactive -input=false
+            echo "🔥 Starting plan of: ${{ github.event.inputs.destroy_directory }}"
+
+    # ===========================================
+    # 2. APPROVAL GATE
+    # ===========================================
+    approval:
+      name: Manual Approval
+      needs: [terragrunt-plan]
+      runs-on: ubuntu-latest
+      environment: ${{ inputs.deploy_approval_environment }}
+
+      steps:
+      - name: Successful Plan - Awaiting Approval
+        id: wait-for-approval
+        run: echo "::notice::✅ ${{ github.actor }} has approved the plan."
+
+    # ===========================================
+    # 3. TERRAGRUNT DESTROY
+    # ===========================================
+    terragrunt-destroy:
+      name: 'Terragrunt Destroy: ${{ inputs.destroy_directory }}'
+      needs: approval
+      runs-on: ubuntu-latest
+
+      steps:
+        # ===========================================
+        # 3.1 CHECKOUT
+        # ===========================================
+        - name: Checkout
+          uses: actions/checkout@v4
+
+        # ===========================================
+        # 3.2  SETUP TERRAFORM AND TERRAGRUNT
+        # ===========================================      
+        - name: Setup terragrunt
+          uses: darthfabax-org/iac/.github/actions/setup-terragrunt@main
+          with:
+            terraform-version: ${{ inputs.tf_version }}
+            terragrunt-version: ${{ inputs.tg_version }}
+
+        # ===========================================
+        # 3.3 CONFIGURE AWS CREDENTIALS
+        # ===========================================      
+        - name: Setup AWS credentials
+          uses: darthfabax-org/iac/.github/actions/setup-aws@main
+          with:
+            role-to-assume: ${{ secrets.AWS_ACTIONS_ROLE_ARN }}
+            aws-region: ${{ inputs.aws_region }}
+            role-session-name: github-actions-terragrunt-destroy
+
+        # ===========================================
+        # 3.4 TERRAGRUNT DESTROY
+        # ===========================================
+        - name: Terragrunt Destroy
+          id : terragrunt-destroy
+          working-directory: ./${{ github.event.inputs.destroy_directory }}
+          run: |
+            echo "🔥 Starting destroy of: ${{ github.event.inputs.destroy_directory }}"
+            terragrunt destroy --terragrunt-non-interactive -input=false -auto-approve
+            echo "✅ Destroy completed for: ${{ github.event.inputs.destroy_directory }}"
+
+        # ===========================================
+        # 3.5 DELETE FILES FROM RUNNER
+        # ===========================================
+        - name: Remove files from runner disk
+          id: remove-files
+          if: steps.terragrunt-destroy.outcome == 'success'
+          run: |
+            echo "🗑️ Deleting directory from disk: ${{ inputs.destroy_directory }}"
+            rm -rf "${{ inputs.destroy_directory }}"
+
+        # ===========================================
+        # 3.6 CREATE PULL REQUEST
+        # ===========================================
+        - name: Create PR
+          if: steps.terragrunt-destroy.outcome == 'success'
+          uses: peter-evans/create-pull-request@v6
+          with:
+            token: ${{ secrets.GITHUB_TOKEN }}
+            commit-message: "chore: remove destroyed infrastructure code in ${{ inputs.destroy_directory }}"
+            committer: "GitHub <noreply@github.com>"
+            author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+            branch: "cleanup/${{ inputs.destroy_directory }}"
+            delete-branch: true
+            title: "Cleanup: Remove infrastructure for ${{ inputs.destroy_directory }}"
+            body: |
+              This PR was automatically generated after a successful `terragrunt destroy`.
+              **Directory removed:** `${{ inputs.destroy_directory }}`
+            # IMPORTANT: Delete 'add-paths' to detect all changes (including deleted).
+
+        # ===========================================
+        # 3.7 GENERATE SUMMARY
+        # ===========================================
+        - name: Generate destroy summary
+          if: always()
+          run: |
+            echo "## 🔥 Terragrun Destroy Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Directory:** \`${{ inputs.destroy_directory }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Region:** \`${{ inputs.aws_region }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+    # ===========================================
+    # 4. NOTIFICATION
+    # ===========================================
+    notify-slack:
+      name: Notify Destroy Result
+      needs: terragrunt-destroy
+      if: always()
+      uses: ./.github/workflows/slack-notify.yml
+      secrets: inherit
+      with:
+        job_status: ${{ needs.terragrunt-destroy.result }}
+        message: |
+          Terragrunt Destroy completed on ${{ inputs.destroy_directory }}
+        workflow_name: 'Terragrunt Destroy'
