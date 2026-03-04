@@ -5,27 +5,15 @@ on:
     inputs:
       # === DEPLOYMENT CONFIGURATION ===
       working_directory:
-        description: 'Working directory for Terragrunt commands'
+        description: "Working directory for Terragrunt commands"
         required: false
         type: string
-        default: 'aws'
+        default: "aws"
       aws_region:
-        description: 'AWS region for deployment'
+        description: "AWS region for deployment"
         required: false
         type: string
-        default: 'eu-south-2'
-        
-      # === TOOL VERSIONS ===
-      tf_version:
-        description: 'Terraform version'
-        required: false
-        type: string
-        default: '1.10.3'
-      tg_version:
-        description: 'Terragrunt version'
-        required: false
-        type: string
-        default: '0.69.11'
+        default: "eu-south-2"
 
 permissions:
   id-token: write
@@ -41,18 +29,18 @@ jobs:
   # 1. TERRAGRUNT APPLY
   # ===========================================
   terragrunt-apply:
-    name: 'Terragrunt Apply: ${{ matrix.directory }}'
+    name: "Terragrunt Apply: ${{ matrix.directory }}"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 3  # Limit concurrent applies to avoid conflicts
+      max-parallel: 3 # Limit concurrent applies to avoid conflicts
       matrix:
-        directory: ['${{ inputs.working_directory }}']
-  
+        directory: ["${{ inputs.working_directory }}"]
+
     steps:
       # ===========================================
       # 1.1 CHECKOUT
-      # ===========================================   
+      # ===========================================
       - name: Checkout repository
         id: checkout-repository
         uses: actions/checkout@v4
@@ -65,12 +53,12 @@ jobs:
         run: |
           WORK_DIR="${{ matrix.directory }}"
           echo "working_directory=$WORK_DIR" >> $GITHUB_OUTPUT
-          
+
           if [ ! -d "$WORK_DIR" ]; then
             echo "::error::Directory not found: $WORK_DIR"
             exit 1
           fi
-          
+
           echo "::notice::✅ Validated directory: $WORK_DIR"
 
       # ===========================================
@@ -78,9 +66,6 @@ jobs:
       # ===========================================
       - name: Setup terragrunt
         uses: darthfabax-org/iac/.github/actions/setup-terragrunt@main
-        with:
-          terraform-version: ${{ inputs.tf_version }}
-          terragrunt-version: ${{ inputs.tg_version }}
 
       # ===========================================
       # 1.4 CACHE PROVIDERS
@@ -107,7 +92,7 @@ jobs:
 
       # ===========================================
       # 1.6 DOWNLOAD AND VALIDATE PLAN ARTIFACT
-      # ===========================================      
+      # ===========================================
       - name: Generate safe artifact name
         id: generate-artifact-name
         if: github.event_name == 'push'
@@ -119,9 +104,9 @@ jobs:
           REGION="${PARTS[2]}"
           RESOURCE_TYPE="${PARTS[4]}"
           RESOURCE_NAME="${PARTS[5]}"
-          
+
           ARTIFACT_NAME="tfplan-${ACCOUNT}-${REGION}-${RESOURCE_TYPE}-${RESOURCE_NAME}"
-          
+
           echo "📦 Artifact: $ARTIFACT_NAME"
           echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
 
@@ -136,37 +121,37 @@ jobs:
         id: validate-plan
         run: |
           PLAN_FILE="${{ matrix.directory }}/tfplan"
-          
+
           echo "::group::Validating Plan Artifact"
-          
+
           if [ ! -f "$PLAN_FILE" ]; then
             echo "::error::Plan file not found: $PLAN_FILE"
             echo "Contents of directory:"
             ls -la "${{ matrix.directory }}"
             exit 1
           fi
-          
+
           FILE_SIZE=$(stat -f%z "$PLAN_FILE" 2>/dev/null || stat -c%s "$PLAN_FILE")
-          
+
           if [ "$FILE_SIZE" -eq 0 ]; then
             echo "::error::Plan file is empty"
             exit 1
           fi
-          
+
           echo "✅ Plan file validated: $FILE_SIZE bytes"
           echo "::endgroup::"
 
       # ===========================================
       # 1.7 APPLY TERRAGRUNT PLAN
-      # ===========================================      
+      # ===========================================
       - name: Apply terragrunt plan
         id: terragrunt-apply
         working-directory: ${{ matrix.directory }}
         run: |
           echo "::group::Applying Terraform Plan"
-          
+
           ls -la
-          
+
           set +e
           terragrunt apply \
             --terragrunt-non-interactive \
@@ -175,15 +160,15 @@ jobs:
             tfplan 2>&1 | tee apply.log
           APPLY_EXIT=${PIPESTATUS[0]}
           set -e
-          
+
           echo "::endgroup::"
-          
+
           if [ $APPLY_EXIT -ne 0 ]; then
             echo "::error::Apply failed with exit code $APPLY_EXIT"
             cat apply.log
             exit $APPLY_EXIT
           fi
-          
+
           echo "::notice::✅ Apply completed successfully"
 
       # ===========================================
@@ -199,7 +184,7 @@ jobs:
           echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ -f "${{ matrix.directory }}/apply.log" ]; then
             echo "<details><summary>Apply Log</summary>" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -222,4 +207,4 @@ jobs:
       job_status: ${{ needs.terragrunt-apply.result }}
       message: |
         Terragrunt Apply completed
-      workflow_name: 'Terragrunt Apply'
+      workflow_name: "Terragrunt Apply"
