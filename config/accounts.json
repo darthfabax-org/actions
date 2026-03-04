@@ -1,0 +1,20 @@
+{
+    "$schema": "./accounts.schema.json",
+    "_comment": "Mapping de cuentas AWS. Los account_ids se almacenan en secrets de organización.",
+    "accounts": {
+        "dfbx": {
+            "environment": "develop",
+            "region": "eu-south-2",
+            "role_name": "github-actions-iac-deploy",
+            "secret_name": "AWS_ACCOUNT_ID_DFBX_DEV",
+            "description": "DFBX develop account"
+        },
+        "xbdf": {
+            "environment": "develop",
+            "region": "us-east-1",
+            "role_name": "github-actions-iac-deploy",
+            "secret_name": "AWS_ACCOUNT_ID_XBDF_DEV",
+            "description": "XBDF develop account"
+        }
+    }
+}
