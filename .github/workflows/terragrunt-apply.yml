@@ -16,12 +16,12 @@ on:
         default: "eu-south-2"
 
       # === TOOL VERSIONS ===
-      tf_version:
+      terraform-version:
         description: "Terraform version"
         required: false
         type: string
         default: "1.11.0"
-      tg_version:
+      terragrunt-version:
         description: "Terragrunt version"
         required: false
         type: string
@@ -79,8 +79,8 @@ jobs:
       - name: Setup terragrunt
         uses: darthfabax-org/iac/.github/actions/setup-terragrunt@main
         with:
-          terraform-version: ${{ inputs.tf_version }}
-          terragrunt-version: ${{ inputs.tg_version }}
+          terraform-version: ${{ inputs.terraform-version }}
+          terragrunt-version: ${{ inputs.terragrunt-version }}
 
       # ===========================================
       # 1.4 CACHE PROVIDERS
